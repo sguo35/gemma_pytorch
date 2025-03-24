@@ -75,7 +75,6 @@ class Gemma3ForMultimodalLM(nn.Module):
             name, gemma_model.precompute_freqs_cis(head_dim, max_seq_len * 2, theta=theta, rope_scaling_factor=rope_scaling_factor)
         )
 
-  @torch.no_grad()
   def forward(self,
                 input_token_ids: torch.Tensor, # B x L
                 image_patches: torch.Tensor, # B x N x C x H x W (3x896x896)

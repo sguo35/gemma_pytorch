@@ -203,7 +203,8 @@ def get_config_for_1b(dtype: str) -> GemmaConfig:
       max_position_embeddings=32_768,
       tokenizer='tokenizer/gemma3_cleaned_262144_v2.spiece.model',
       use_qk_norm=True,
-      vision_config=None,
+      vision_config=siglip_vision_config.get_siglip_vision_model_config(),
+      rope_scaling_factor=8,
   )
 
 

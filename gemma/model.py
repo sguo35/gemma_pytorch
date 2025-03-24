@@ -88,6 +88,41 @@ class Sampler(nn.Module):
         return next_token_ids, logits
 
 
+
+class RawModelOutput(nn.Module):
+
+    def __init__(self, vocab_size: int, config: gemma_config.GemmaConfig):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.config = config
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        hidden_states: torch.Tensor,
+        output_positions: torch.Tensor,
+        temperatures: Union[torch.Tensor, None],
+        top_ps: torch.Tensor,
+        top_ks: torch.Tensor,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = torch.matmul(hidden_states, embedding.t())
+        if embedding_bias is not None:
+            logits += embedding_bias
+        if self.config.final_logit_softcapping is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
+
+        if temperatures is None:
+            return torch.argmax(logits, dim=-1).squeeze(dim=-1), logits
+
+        # Apply temperature scaling.
+        logits.div_(temperatures.reshape(-1, 1, 1))
+
+        return logits
+
+
 def precompute_freqs_cis(dim: int,
                          end: int,
                          theta: float = 10000.0,
@@ -524,6 +559,7 @@ class GemmaForCausalLM(nn.Module):
     self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
     self.model = GemmaModel(config)
     self.sampler = Sampler(vocab_size, config)
+    self.raw_model_output = RawModelOutput(vocab_size, config)
 
     # Pre-compute rotary embedding table.
     if config.architecture == gemma_config.Architecture.GEMMA_3:
@@ -555,7 +591,6 @@ class GemmaForCausalLM(nn.Module):
             name, precompute_freqs_cis(head_dim, max_seq_len * 2, theta=theta)
         )
 
-  @torch.no_grad()
   def forward(
         self,
         input_token_ids: torch.Tensor,
@@ -570,6 +605,7 @@ class GemmaForCausalLM(nn.Module):
         local_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
     freqs_cis = {}
 
     if self.config.architecture == gemma_config.Architecture.GEMMA_3:
@@ -609,7 +645,10 @@ class GemmaForCausalLM(nn.Module):
     if self.config.quant:
       embedder_weight = (
                 embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
-    next_tokens, logits = self.sampler(
+
+
+    if kwargs.get('return_raw_model_probs', False):
+        raw_probs = self.raw_model_output(
             embedding=embedder_weight,
             hidden_states=hidden_states,
             output_positions=output_positions,
@@ -617,11 +656,22 @@ class GemmaForCausalLM(nn.Module):
             top_ps=top_ps,
             top_ks=top_ks,
         )
-    return next_tokens, logits
+        return raw_probs
+    else:
+        next_tokens, logits = self.sampler(
+            embedding=embedder_weight,
+            hidden_states=hidden_states,
+            output_positions=output_positions,
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+        )
+
+        return next_tokens, logits
 
   def generate(
         self,
-        prompts: Union[str, Sequence[str]],
+        prompts: Union[str, Sequence[str], Sequence[Sequence[int]]],
         device: Any,
         output_len: int = 100,
         temperature: Union[float, None] = 1.0,
@@ -635,7 +685,11 @@ class GemmaForCausalLM(nn.Module):
       prompts = [prompts]
 
     batch_size = len(prompts)
-    prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+
+    if isinstance(prompts[0], str):
+        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+    else:
+        prompt_tokens = prompts
     min_prompt_len = min(len(p) for p in prompt_tokens)
     max_prompt_len = max(len(p) for p in prompt_tokens)
     max_seq_len = max_prompt_len + output_len
@@ -733,6 +787,97 @@ class GemmaForCausalLM(nn.Module):
 
     # If a string was provided as input, return a string as output.
     return results[0] if is_str_prompt else results
+
+
+  def tokenize_and_forward(
+        self,
+        prompts: Union[str, Sequence[str], Sequence[Sequence[int]]],
+        device: Any,
+        output_len: int = 100,
+        temperature: Union[float, None] = 1.0,
+        top_p: float = 0.95,
+        top_k: int = 64,
+        mask: torch.Tensor = None,
+    ) -> Union[str, Sequence[str]]:
+    """Generates responses for given prompts using Gemma model."""
+    # Inference only.
+    is_str_prompt = isinstance(prompts, str)
+    if is_str_prompt:
+      prompts = [prompts]
+
+    batch_size = len(prompts)
+
+    if isinstance(prompts[0], str):
+        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+    else:
+        prompt_tokens = prompts
+        
+    min_prompt_len = min(len(p) for p in prompt_tokens)
+    max_prompt_len = max(len(p) for p in prompt_tokens)
+    max_seq_len = max_prompt_len + output_len
+    assert max_seq_len <= self.config.max_position_embeddings
+
+    # build KV caches
+    kv_caches = []
+    for _ in range(self.config.num_hidden_layers):
+      size = (batch_size, max_seq_len, self.config.num_key_value_heads,
+                    self.config.head_dim)
+      dtype = self.config.get_dtype()
+      k_cache = torch.zeros(size=size, dtype=dtype, device=device)
+      v_cache = torch.zeros(size=size, dtype=dtype, device=device)
+      kv_caches.append((k_cache, v_cache))
+
+    # prepare inputs
+    token_ids_tensor = torch.full((batch_size, max_seq_len),
+                                      self.tokenizer.pad_id, dtype=torch.int64)
+    input_token_ids_tensor = torch.full((batch_size, min_prompt_len),
+                                            self.tokenizer.pad_id,
+                                            dtype=torch.int64)
+    for i, p in enumerate(prompt_tokens):
+      token_ids_tensor[i, :len(p)] = torch.tensor(p)
+      input_token_ids_tensor[i, :min_prompt_len] = torch.tensor(
+                p[:min_prompt_len])
+    token_ids_tensor = token_ids_tensor.to(device)
+    input_token_ids_tensor = input_token_ids_tensor.to(device)
+
+    prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id
+    input_positions_tensor = torch.arange(0, min_prompt_len,
+                                              dtype=torch.int64).to(device)
+    if mask is not None:
+        mask_tensor = mask.to(device)
+    else:
+        mask_tensor = torch.full((1, 1, max_seq_len, max_seq_len),
+                                    -2.3819763e38).to(torch.float)
+        mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
+    local_mask_tensor = mask_tensor + torch.tril(
+            torch.full((1, 1, max_seq_len, max_seq_len), -2.3819763e38, device=device),
+            diagonal=-self.config.sliding_window_size,
+        ) if self.config.sliding_window_size else None
+    curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
+    curr_local_mask_tensor = local_mask_tensor.index_select(
+          2, input_positions_tensor
+      ) if local_mask_tensor is not None else None
+    output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(device)
+    temperatures_tensor = None if not temperature else torch.FloatTensor(
+            [temperature] * batch_size).to(device)
+    top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
+    top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+    output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
+            device)
+
+    return self(
+        input_token_ids=input_token_ids_tensor,
+        input_positions=input_positions_tensor,
+        kv_write_indices=None,
+        kv_caches=kv_caches,
+        mask=curr_mask_tensor,
+        output_positions=output_positions_tensor,
+        temperatures=temperatures_tensor,
+        top_ps=top_ps_tensor,
+        top_ks=top_ks_tensor,
+        local_mask=curr_local_mask_tensor,
+        return_raw_model_probs=True
+    )
 
   def load_weights(self, model_path: str):
         if os.path.isfile(model_path):
